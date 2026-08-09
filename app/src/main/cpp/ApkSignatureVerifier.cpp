@@ -233,6 +233,55 @@ bool ExtractSha256ContentDigest(const uint8_t *signers, size_t signersLength, ui
     return false;
 }
 
+const char *JcaKeyAlgorithm(uint32_t scheme) {
+    switch (scheme) { case 0x0101U: case 0x0102U: case 0x0421U: case 0x0422U: return "RSA"; case 0x0103U: case 0x0104U: return "EC"; case 0x0105U: case 0x0106U: return "DSA"; default: return nullptr; }
+}
+
+const char *JcaSignatureAlgorithm(uint32_t scheme) {
+    switch (scheme) {
+        case 0x0101U: return "SHA256withRSA"; case 0x0102U: return "SHA512withRSA";
+        case 0x0103U: return "SHA256withECDSA"; case 0x0104U: return "SHA512withECDSA";
+        case 0x0105U: return "SHA256withDSA"; case 0x0106U: return "SHA512withDSA";
+        case 0x0421U: return "SHA256withRSA/PSS"; case 0x0422U: return "SHA512withRSA/PSS";
+        default: return nullptr;
+    }
+}
+
+bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLength) {
+    if (env == nullptr) return false;
+    size_t outerOffset = 0, signerOffset = 0, signerFieldsOffset = 0, signatureOffset = 0, keyOffset = 0;
+    const uint8_t *outer = nullptr, *signer = nullptr, *signedData = nullptr, *signatures = nullptr, *publicKey = nullptr;
+    size_t outerLength = 0, signerLength = 0, signedDataLength = 0, signaturesLength = 0, publicKeyLength = 0;
+    if (!ReadLengthPrefixed(signers, signersLength, &outerOffset, &outer, &outerLength) || outerOffset != signersLength ||
+        !ReadLengthPrefixed(outer, outerLength, &signerOffset, &signer, &signerLength) || signerOffset != outerLength ||
+        !ReadLengthPrefixed(signer, signerLength, &signerFieldsOffset, &signedData, &signedDataLength) ||
+        !ReadLengthPrefixed(signer, signerLength, &signerFieldsOffset, &signatures, &signaturesLength) ||
+        !ReadLengthPrefixed(signer, signerLength, &signerFieldsOffset, &publicKey, &publicKeyLength)) return false;
+    uint32_t scheme = 0; const uint8_t *signature = nullptr; size_t signatureLength = 0;
+    while (signatureOffset < signaturesLength) {
+        const uint8_t *record = nullptr; size_t recordLength = 0;
+        if (!ReadLengthPrefixed(signatures, signaturesLength, &signatureOffset, &record, &recordLength) || recordLength < 8) return false;
+        const uint32_t candidate = ReadU32(record); size_t offset = 4; const uint8_t *value = nullptr; size_t length = 0;
+        if (!ReadLengthPrefixed(record, recordLength, &offset, &value, &length) || offset != recordLength) return false;
+        if (JcaSignatureAlgorithm(candidate) != nullptr) { scheme = candidate; signature = value; signatureLength = length; break; }
+    }
+    const char *keyAlgorithm = JcaKeyAlgorithm(scheme); const char *signatureAlgorithm = JcaSignatureAlgorithm(scheme);
+    if (keyAlgorithm == nullptr || signatureAlgorithm == nullptr) return false;
+    jclass specClass = env->FindClass("java/security/spec/X509EncodedKeySpec"); jclass keyFactoryClass = env->FindClass("java/security/KeyFactory"); jclass signatureClass = env->FindClass("java/security/Signature");
+    if (specClass == nullptr || keyFactoryClass == nullptr || signatureClass == nullptr) { env->ExceptionClear(); return false; }
+    jbyteArray keyBytes = env->NewByteArray(static_cast<jsize>(publicKeyLength)); jbyteArray signedBytes = env->NewByteArray(static_cast<jsize>(signedDataLength)); jbyteArray signatureBytes = env->NewByteArray(static_cast<jsize>(signatureLength));
+    if (keyBytes == nullptr || signedBytes == nullptr || signatureBytes == nullptr) return false;
+    env->SetByteArrayRegion(keyBytes, 0, static_cast<jsize>(publicKeyLength), reinterpret_cast<const jbyte *>(publicKey)); env->SetByteArrayRegion(signedBytes, 0, static_cast<jsize>(signedDataLength), reinterpret_cast<const jbyte *>(signedData)); env->SetByteArrayRegion(signatureBytes, 0, static_cast<jsize>(signatureLength), reinterpret_cast<const jbyte *>(signature));
+    jmethodID specInit = env->GetMethodID(specClass, "<init>", "([B)V"); jobject spec = env->NewObject(specClass, specInit, keyBytes);
+    jmethodID factoryGet = env->GetStaticMethodID(keyFactoryClass, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;"); jstring keyName = env->NewStringUTF(keyAlgorithm); jobject factory = env->CallStaticObjectMethod(keyFactoryClass, factoryGet, keyName);
+    jmethodID generatePublic = env->GetMethodID(keyFactoryClass, "generatePublic", "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;"); jobject publicKeyObject = env->CallObjectMethod(factory, generatePublic, spec);
+    jmethodID signatureGet = env->GetStaticMethodID(signatureClass, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;"); jstring signatureName = env->NewStringUTF(signatureAlgorithm); jobject verifier = env->CallStaticObjectMethod(signatureClass, signatureGet, signatureName);
+    jmethodID initVerify = env->GetMethodID(signatureClass, "initVerify", "(Ljava/security/PublicKey;)V"); jmethodID update = env->GetMethodID(signatureClass, "update", "([B)V"); jmethodID verify = env->GetMethodID(signatureClass, "verify", "([B)Z");
+    env->CallVoidMethod(verifier, initVerify, publicKeyObject); env->CallVoidMethod(verifier, update, signedBytes); const jboolean verified = env->CallBooleanMethod(verifier, verify, signatureBytes);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    return verified == JNI_TRUE;
+}
+
 bool HashChunk(int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 32> *out) {
     Sha256 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
             static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
@@ -256,7 +305,7 @@ bool HashMemoryChunk(const uint8_t *data, uint32_t length, std::array<uint8_t, 3
     hash.Update(&marker, 1); hash.Update(size, sizeof(size)); hash.Update(data, length); *out = hash.Final(); return true;
 }
 
-bool VerifyContentDigestFromFile(const std::string &apkPath) {
+bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
     const int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, apkPath.c_str(), O_RDONLY | O_CLOEXEC, 0));
     struct stat statInfo{}; if (fd < 0 || fstat(fd, &statInfo) != 0 || statInfo.st_size < static_cast<off_t>(kEocdMinSize)) { if (fd >= 0) close(fd); return false; }
     const uint64_t fileSize = static_cast<uint64_t>(statInfo.st_size); const size_t tailSize = static_cast<size_t>(fileSize < kMaxEocdSearch ? fileSize : kMaxEocdSearch);
@@ -270,7 +319,7 @@ bool VerifyContentDigestFromFile(const std::string &apkPath) {
     std::vector<uint8_t> block(static_cast<size_t>(blockSize + 8)); if (!RawReadAt(fd, blockOffset, block.data(), block.size())) { close(fd); return false; }
     const uint8_t *scheme = nullptr; size_t schemeLength = 0; size_t entryOffset = 8; const size_t entriesEnd = block.size() - 24;
     while (entryOffset < entriesEnd) { const uint64_t length = ReadU64(block.data() + entryOffset); entryOffset += 8; if (length < 4 || length > entriesEnd - entryOffset) { close(fd); return false; } const uint32_t id = ReadU32(block.data() + entryOffset); if (id == kApkSignatureSchemeV3BlockId || (scheme == nullptr && id == kApkSignatureSchemeV2BlockId)) { scheme = block.data() + entryOffset + 4; schemeLength = static_cast<size_t>(length - 4); } entryOffset += static_cast<size_t>(length); }
-    uint8_t expected[32]{}; if (scheme == nullptr || !ExtractSha256ContentDigest(scheme, schemeLength, expected)) { close(fd); return false; }
+    uint8_t expected[32]{}; if (scheme == nullptr || !VerifySignerSignature(env, scheme, schemeLength) || !ExtractSha256ContentDigest(scheme, schemeLength, expected)) { close(fd); return false; }
     std::vector<std::array<uint8_t, 32>> chunks; const uint64_t chunkSize = 1024U * 1024U;
     auto appendSection = [&](uint64_t offset, uint64_t length) -> bool { while (length > 0) { const uint32_t take = static_cast<uint32_t>(length < chunkSize ? length : chunkSize); std::array<uint8_t, 32> digest{}; if (!HashChunk(fd, offset, take, &digest)) return false; chunks.push_back(digest); offset += take; length -= take; } return true; };
     bool ok = appendSection(0, blockOffset) && appendSection(centralDirectoryOffset, eocdOffset - centralDirectoryOffset);
@@ -359,5 +408,5 @@ bool VerifyApkV2V3ContentDigest(JNIEnv *env, jobject context) {
     std::string sourceDir;
     if (env != nullptr && context != nullptr) sourceDir = GetSourceDirFromJni(env, context);
     if (sourceDir.empty()) sourceDir = GetSourceDirFromMaps();
-    return !sourceDir.empty() && VerifyContentDigestFromFile(sourceDir);
+    return !sourceDir.empty() && VerifyContentDigestFromFile(env, sourceDir);
 }
