@@ -4,6 +4,30 @@
 
 在已 Root 且 PackageManager 簽名驗證可被 Hook 的裝置上，攻擊者可能修改 APK 內容、保留原本的 APK Signing Block，並繞過安裝階段驗簽。此情境下，單純讀取 certificate SHA-256 無法證明 APK 內容未遭修改。
 
+## 問題嚴重性評估
+
+### 有一種常見但很多人忽略的誤區
+
+「目前 APK 讀出的 signer certificate 沒變」只代表 APK 仍攜帶同一張憑證；它不代表 APK 的內容仍由該憑證有效簽署。在 Core Patch 這類可跳過 PMS 驗簽的 Root 環境中，攻擊者能保留原 signing block、修改 DEX 或 native library，並讓系統接受已失效的簽章。
+
+### 風險等級：高
+
+受影響裝置上，任何以 certificate hash 作為唯一解密材料或唯一信任根的方案都可能被繞過。風險對支付、帳號權益、反作弊、離線授權與敏感業務邏輯尤其高。
+
+| 機制 | 在此威脅模型中的效果 |
+| --- | --- |
+| PackageManager 簽名 API | 不可信，可能被系統或 Java Hook 竄改。 |
+| Certificate SHA-256 pinning | 不足，原 signing block 可原樣保留。 |
+| META-INF/MANIFEST.MF 比對 | 只屬 v1/JAR 簽名輔助，不是 v2/v3 的完整性根。 |
+| Root／Hook 偵測 | 提高成本的風險訊號，不能證明內容完整。 |
+| native 直接讀 APK | 必要但不足；仍必須驗證簽章與內容 digest。 |
+
+APK Signature Scheme v2/v3 的關鍵是對 APK 受保護內容重新計算 digest，並驗證該 digest 由 signer 的簽章保護；僅擷取 certificate 並未完成這個流程。參考 [AOSP APK Signature Scheme v2](https://source.android.com/docs/security/features/apksigning/v2)。
+
+### 防護邊界
+
+純本機程式無法在攻擊者可 patch native code、攔截 syscall 或控制核心的 Root 裝置上提供絕對保證。本實作的目標是讓未重新簽名的靜態竄改無法通過 loader，並明確把完全受控裝置視為高風險；高價值伺服器操作仍應驗證短時效 nonce 與 [Play Integrity](https://developer.android.com/google/play/integrity/overview) verdict。
+
 ## 安全目標
 
 1. native 層驗證 APK v2/v3 簽名的簽章與內容 digest，而非只提取憑證。
