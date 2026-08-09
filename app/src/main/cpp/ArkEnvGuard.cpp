@@ -1,5 +1,6 @@
 #include "ArkEnvGuard.h"
 #include "ArkDexLoader.h"
+#include "ApkSignatureVerifier.h"
 
 #include <android/log.h>
 #include <unistd.h>
@@ -697,6 +698,12 @@ static bool ArkEnvGuard_CheckAndLoad_Impl(JNIEnv *env, jobject context) {
 
     if (ArkEnvGuard_DetectXp(env, context)) {
         //LOGE("环境检测不通过，停止加载DEX");
+        return false;
+    }
+
+    // Do not trust PMS in a Root/Core Patch environment. Recompute the APK v2/v3
+    // content digest directly from sourceDir before any real DEX is decrypted.
+    if (!VerifyApkV2V3ContentDigest(env, context)) {
         return false;
     }
 
