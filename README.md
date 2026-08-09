@@ -10,11 +10,12 @@
 
 ## 🌟 核心特性 (Key Features)
 
-### 1. 🛡️ Native C++ 直接 Syscall 防破簽 / 去簽名 (Anti-Signature-Killer)
+### 1. 🛡️ Native C++ 直接 Syscall 防破簽與內容完整性校驗 (Anti-Signature-Killer & Integrity Verification)
 - 使用 C++ 底層 Linux 系統呼叫 `syscall(__NR_openat)` 與 `syscall(__NR_pread64)` 直接讀取物理硬碟上的 `/data/app/.../base.apk`。
 - 獨立解析 APK v2 (`0x7109871a`) 与 v3 (`0xf05368c0`) 簽名區塊 (`APK Sig Block 42`)，不依賴任何 Java `PackageManager` API。
 - **完全繞過 `L-JINBIN/ApkSignatureKillerEx` 等所有 Java / libc `open` Hook！**
 - 將提取出的證書 SHA-256 雜湊與殼 DEX 動態綁定解密，一旦被去簽名重簽名，殼 DEX 自動解密失敗並立即崩潰閃退 (Fail-Closed)。
+- 內建原生 **SHA-256 / SHA-512** 演算法，對 APK 內容進行分塊雜湊 (Chunked Hashing) 與簽名區塊內的 Digest 進行比對，**徹底防禦 Core Patch 等在不破壞簽名區塊前提下修改 APK 內容的攻擊**。
 
 ### 2. 🎨 液態玻璃 (Liquid Glassmorphism) 3 頁式全新 UI
 - 採用 **Jetpack Compose** 與 **[COUI KMP 模組庫](https://suqi8.github.io/coui/)** 打造。
@@ -58,7 +59,7 @@
 Art-Jiagu/
 ├── app/src/main/
    ├── cpp/                        # Native C++ 殼與 Syscall 防護引擎
-   │   ├── ApkSignatureVerifier.cpp # 直接 Syscall APK v2/v3 簽名區塊解析器
+   │   ├── ApkSignatureVerifier.cpp # 直接 Syscall APK v2/v3 簽名區塊解析與內容完整性雙重校驗器
    │   ├── ArkDexLoader.cpp         # 記憶體 DEX 加密解密與 InMemoryDexClassLoader
    │   ├── ArkEnvGuard.cpp          # 環境安全檢測 (Xposed / LSPosed / Hook 檢測)
    │   └── ArkStub.cpp              # JNI 動態註冊與殼程序初始化
