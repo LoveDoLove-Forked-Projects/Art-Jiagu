@@ -211,7 +211,17 @@ bool ReadSigningBlockSha256FromFile(const std::string &apkPath, uint8_t outSha25
     return v2 != nullptr && ExtractFirstCertificateSha256(std::vector<uint8_t>(v2, v2 + v2Length), outSha256);
 }
 
-bool ExtractSha256ContentDigest(const uint8_t *signers, size_t signersLength, uint8_t outDigest[32]) {
+bool IsSha256ContentDigest(uint32_t algorithm) {
+    return algorithm == 0x0101U || algorithm == 0x0103U || algorithm == 0x0201U || algorithm == 0x0301U;
+}
+
+bool IsSha512ContentDigest(uint32_t algorithm) {
+    return algorithm == 0x0102U || algorithm == 0x0104U || algorithm == 0x0202U || algorithm == 0x0302U;
+}
+
+bool ExtractContentDigest(const uint8_t *signers, size_t signersLength, uint32_t requiredAlgorithm,
+                          std::vector<uint8_t> *outDigest, bool *isSha512) {
+    if (outDigest == nullptr || isSha512 == nullptr) return false;
     size_t outerOffset = 0, signerOffset = 0, signedDataOffset = 0, digestOffset = 0;
     const uint8_t *outer = nullptr, *signer = nullptr, *signedData = nullptr, *digests = nullptr;
     size_t outerLength = 0, signerLength = 0, signedDataLength = 0, digestsLength = 0;
@@ -226,15 +236,19 @@ bool ExtractSha256ContentDigest(const uint8_t *signers, size_t signersLength, ui
         const uint32_t algorithm = ReadU32(record);
         size_t digestValueOffset = 4; const uint8_t *digest = nullptr; size_t digestLength = 0;
         if (!ReadLengthPrefixed(record, recordLength, &digestValueOffset, &digest, &digestLength) || digestValueOffset != recordLength) return false;
-        if (digestLength == 32 && (algorithm == 0x0101U || algorithm == 0x0103U || algorithm == 0x0201U || algorithm == 0x0301U)) {
-            memcpy(outDigest, digest, 32); return true;
+        if (algorithm == requiredAlgorithm &&
+            ((digestLength == 32 && IsSha256ContentDigest(algorithm)) ||
+            (digestLength == 64 && IsSha512ContentDigest(algorithm)))) {
+            outDigest->assign(digest, digest + digestLength);
+            *isSha512 = digestLength == 64;
+            return true;
         }
     }
     return false;
 }
 
 const char *JcaKeyAlgorithm(uint32_t scheme) {
-    switch (scheme) { case 0x0101U: case 0x0102U: case 0x0103U: case 0x0104U: return "RSA"; case 0x0201U: case 0x0202U: return "EC"; case 0x0301U: return "DSA"; default: return nullptr; }
+    switch (scheme) { case 0x0101U: case 0x0102U: case 0x0103U: case 0x0104U: return "RSA"; case 0x0201U: case 0x0202U: return "EC"; case 0x0301U: case 0x0302U: return "DSA"; default: return nullptr; }
 }
 
 const char *JcaSignatureAlgorithm(uint32_t scheme) {
@@ -242,13 +256,14 @@ const char *JcaSignatureAlgorithm(uint32_t scheme) {
         case 0x0101U: case 0x0102U: return "RSASSA-PSS";
         case 0x0103U: return "SHA256withRSA"; case 0x0104U: return "SHA512withRSA";
         case 0x0201U: return "SHA256withECDSA"; case 0x0202U: return "SHA512withECDSA";
-        case 0x0301U: return "SHA256withDSA";
+        case 0x0301U: return "SHA256withDSA"; case 0x0302U: return "SHA512withDSA";
         default: return nullptr;
     }
 }
 
-bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLength) {
-    if (env == nullptr) return false;
+bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLength,
+                           uint32_t *verifiedScheme) {
+    if (env == nullptr || verifiedScheme == nullptr) return false;
     size_t outerOffset = 0, signerOffset = 0, signerFieldsOffset = 0, signatureOffset = 0, keyOffset = 0;
     const uint8_t *outer = nullptr, *signer = nullptr, *signedData = nullptr, *signatures = nullptr, *publicKey = nullptr;
     size_t outerLength = 0, signerLength = 0, signedDataLength = 0, signaturesLength = 0, publicKeyLength = 0;
@@ -288,7 +303,9 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     }
     env->CallVoidMethod(verifier, initVerify, publicKeyObject); env->CallVoidMethod(verifier, update, signedBytes); const jboolean verified = env->CallBooleanMethod(verifier, verify, signatureBytes);
     if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-    return verified == JNI_TRUE;
+    if (verified != JNI_TRUE) return false;
+    *verifiedScheme = scheme;
+    return true;
 }
 
 bool HashChunk(int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 32> *out) {
@@ -314,6 +331,43 @@ bool HashMemoryChunk(const uint8_t *data, uint32_t length, std::array<uint8_t, 3
     hash.Update(&marker, 1); hash.Update(size, sizeof(size)); hash.Update(data, length); *out = hash.Final(); return true;
 }
 
+bool JavaSha512(JNIEnv *env, const uint8_t *data, size_t length, std::array<uint8_t, 64> *out) {
+    if (env == nullptr || data == nullptr || out == nullptr || length > static_cast<size_t>(INT32_MAX)) return false;
+    jclass digestClass = env->FindClass("java/security/MessageDigest");
+    if (digestClass == nullptr) { env->ExceptionClear(); return false; }
+    jmethodID getInstance = env->GetStaticMethodID(digestClass, "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
+    jmethodID digest = env->GetMethodID(digestClass, "digest", "([B)[B");
+    if (getInstance == nullptr || digest == nullptr) { env->ExceptionClear(); return false; }
+    jstring name = env->NewStringUTF("SHA-512");
+    jbyteArray input = env->NewByteArray(static_cast<jsize>(length));
+    if (name == nullptr || input == nullptr) { env->ExceptionClear(); return false; }
+    env->SetByteArrayRegion(input, 0, static_cast<jsize>(length), reinterpret_cast<const jbyte *>(data));
+    jobject instance = env->CallStaticObjectMethod(digestClass, getInstance, name);
+    if (env->ExceptionCheck() || instance == nullptr) { env->ExceptionClear(); return false; }
+    auto result = static_cast<jbyteArray>(env->CallObjectMethod(instance, digest, input));
+    if (env->ExceptionCheck() || result == nullptr || env->GetArrayLength(result) != 64) { env->ExceptionClear(); return false; }
+    env->GetByteArrayRegion(result, 0, 64, reinterpret_cast<jbyte *>(out->data()));
+    return !env->ExceptionCheck();
+}
+
+bool HashChunkSha512(JNIEnv *env, int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 64> *out) {
+    std::vector<uint8_t> input(5U + length);
+    input[0] = 0xa5;
+    input[1] = static_cast<uint8_t>(length); input[2] = static_cast<uint8_t>(length >> 8U);
+    input[3] = static_cast<uint8_t>(length >> 16U); input[4] = static_cast<uint8_t>(length >> 24U);
+    return RawReadAt(fd, offset, input.data() + 5, length) && JavaSha512(env, input.data(), input.size(), out);
+}
+
+bool HashMemoryChunkSha512(JNIEnv *env, const uint8_t *data, uint32_t length, std::array<uint8_t, 64> *out) {
+    if (data == nullptr) return false;
+    std::vector<uint8_t> input(5U + length);
+    input[0] = 0xa5;
+    input[1] = static_cast<uint8_t>(length); input[2] = static_cast<uint8_t>(length >> 8U);
+    input[3] = static_cast<uint8_t>(length >> 16U); input[4] = static_cast<uint8_t>(length >> 24U);
+    memcpy(input.data() + 5, data, length);
+    return JavaSha512(env, input.data(), input.size(), out);
+}
+
 bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
     const int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, apkPath.c_str(), O_RDONLY | O_CLOEXEC, 0));
     struct stat statInfo{}; if (fd < 0 || fstat(fd, &statInfo) != 0 || statInfo.st_size < static_cast<off_t>(kEocdMinSize)) { if (fd >= 0) close(fd); return false; }
@@ -324,23 +378,45 @@ bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
     if (!found) { close(fd); return false; }
     const uint64_t eocdOffset = fileSize - tailSize + eocdInTail; const uint64_t centralDirectoryOffset = ReadU32(tail.data() + eocdInTail + 16);
     uint8_t footer[24]{}; if (centralDirectoryOffset < 24 || !RawReadAt(fd, centralDirectoryOffset - 24, footer, 24) || memcmp(footer + 8, kSigningBlockMagic, sizeof(kSigningBlockMagic) - 1) != 0) { close(fd); return false; }
-    const uint64_t blockSize = ReadU64(footer); const uint64_t blockOffset = centralDirectoryOffset - blockSize - 8;
-    std::vector<uint8_t> block(static_cast<size_t>(blockSize + 8)); if (!RawReadAt(fd, blockOffset, block.data(), block.size())) { close(fd); return false; }
+    const uint64_t blockSize = ReadU64(footer);
+    if (blockSize < 24 || blockSize > centralDirectoryOffset - 8 || blockSize > 16U * 1024U * 1024U) { close(fd); return false; }
+    const uint64_t blockOffset = centralDirectoryOffset - blockSize - 8;
+    std::vector<uint8_t> block(static_cast<size_t>(blockSize + 8));
+    if (!RawReadAt(fd, blockOffset, block.data(), block.size()) || ReadU64(block.data()) != blockSize) { close(fd); return false; }
     const uint8_t *scheme = nullptr; size_t schemeLength = 0; size_t entryOffset = 8; const size_t entriesEnd = block.size() - 24;
-    while (entryOffset < entriesEnd) { const uint64_t length = ReadU64(block.data() + entryOffset); entryOffset += 8; if (length < 4 || length > entriesEnd - entryOffset) { close(fd); return false; } const uint32_t id = ReadU32(block.data() + entryOffset); if (id == kApkSignatureSchemeV3BlockId || (scheme == nullptr && id == kApkSignatureSchemeV2BlockId)) { scheme = block.data() + entryOffset + 4; schemeLength = static_cast<size_t>(length - 4); } entryOffset += static_cast<size_t>(length); }
-    uint8_t expected[32]{}; if (scheme == nullptr || !VerifySignerSignature(env, scheme, schemeLength) || !ExtractSha256ContentDigest(scheme, schemeLength, expected)) { close(fd); return false; }
+    while (entryOffset < entriesEnd) { if (entriesEnd - entryOffset < 12) { close(fd); return false; } const uint64_t length = ReadU64(block.data() + entryOffset); entryOffset += 8; if (length < 4 || length > entriesEnd - entryOffset) { close(fd); return false; } const uint32_t id = ReadU32(block.data() + entryOffset); if (id == kApkSignatureSchemeV3BlockId || (scheme == nullptr && id == kApkSignatureSchemeV2BlockId)) { scheme = block.data() + entryOffset + 4; schemeLength = static_cast<size_t>(length - 4); } entryOffset += static_cast<size_t>(length); }
+    if (entryOffset != entriesEnd) { close(fd); return false; }
+    std::vector<uint8_t> expected; bool useSha512 = false; uint32_t verifiedScheme = 0;
+    if (scheme == nullptr || !VerifySignerSignature(env, scheme, schemeLength, &verifiedScheme) || !ExtractContentDigest(scheme, schemeLength, verifiedScheme, &expected, &useSha512)) { close(fd); return false; }
     std::vector<std::array<uint8_t, 32>> chunks; const uint64_t chunkSize = 1024U * 1024U;
     auto appendSection = [&](uint64_t offset, uint64_t length) -> bool { while (length > 0) { const uint32_t take = static_cast<uint32_t>(length < chunkSize ? length : chunkSize); std::array<uint8_t, 32> digest{}; if (!HashChunk(fd, offset, take, &digest)) return false; chunks.push_back(digest); offset += take; length -= take; } return true; };
     bool ok = appendSection(0, blockOffset) && appendSection(centralDirectoryOffset, eocdOffset - centralDirectoryOffset);
     std::vector<uint8_t> eocd(tail.begin() + eocdInTail, tail.end()); if (eocd.size() < 20) ok = false; else { const uint32_t patched = static_cast<uint32_t>(blockOffset); eocd[16] = patched; eocd[17] = patched >> 8U; eocd[18] = patched >> 16U; eocd[19] = patched >> 24U; }
-    if (ok) {
+    if (ok && !useSha512) {
         std::array<uint8_t, 32> eocdDigest{};
         ok = HashMemoryChunk(eocd.data(), static_cast<uint32_t>(eocd.size()), &eocdDigest);
         chunks.push_back(eocdDigest);
         const uint8_t marker = 0x5a; const uint32_t chunkCount = static_cast<uint32_t>(chunks.size());
         uint8_t count[4] = {static_cast<uint8_t>(chunkCount), static_cast<uint8_t>(chunkCount >> 8U), static_cast<uint8_t>(chunkCount >> 16U), static_cast<uint8_t>(chunkCount >> 24U)};
         Sha256 root; root.Update(&marker, 1); root.Update(count, 4); for (const auto &chunk : chunks) root.Update(chunk.data(), chunk.size());
-        const auto actual = root.Final(); ok = memcmp(actual.data(), expected, 32) == 0;
+        const auto actual = root.Final(); ok = expected.size() == actual.size() && memcmp(actual.data(), expected.data(), actual.size()) == 0;
+    }
+    if (ok && useSha512) {
+        std::vector<std::array<uint8_t, 64>> sha512Chunks;
+        auto appendSha512Section = [&](uint64_t offset, uint64_t length) -> bool { while (length > 0) { const uint32_t take = static_cast<uint32_t>(length < chunkSize ? length : chunkSize); std::array<uint8_t, 64> digest{}; if (!HashChunkSha512(env, fd, offset, take, &digest)) return false; sha512Chunks.push_back(digest); offset += take; length -= take; } return true; };
+        ok = appendSha512Section(0, blockOffset) && appendSha512Section(centralDirectoryOffset, eocdOffset - centralDirectoryOffset);
+        std::array<uint8_t, 64> eocdDigest{};
+        if (ok) ok = HashMemoryChunkSha512(env, eocd.data(), static_cast<uint32_t>(eocd.size()), &eocdDigest);
+        if (ok) {
+            sha512Chunks.push_back(eocdDigest);
+            std::vector<uint8_t> rootInput(5U + sha512Chunks.size() * 64U);
+            rootInput[0] = 0x5a; const uint32_t count = static_cast<uint32_t>(sha512Chunks.size());
+            rootInput[1] = static_cast<uint8_t>(count); rootInput[2] = static_cast<uint8_t>(count >> 8U);
+            rootInput[3] = static_cast<uint8_t>(count >> 16U); rootInput[4] = static_cast<uint8_t>(count >> 24U);
+            for (size_t i = 0; i < sha512Chunks.size(); ++i) memcpy(rootInput.data() + 5 + i * 64U, sha512Chunks[i].data(), 64);
+            std::array<uint8_t, 64> actual{};
+            ok = JavaSha512(env, rootInput.data(), rootInput.size(), &actual) && expected.size() == actual.size() && memcmp(actual.data(), expected.data(), actual.size()) == 0;
+        }
     }
     close(fd); return ok;
 }

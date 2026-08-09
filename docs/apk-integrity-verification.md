@@ -53,9 +53,9 @@ APK Signature Scheme v2/v3 的關鍵是對 APK 受保護內容重新計算 diges
 native gate 在真實 DEX 解密前執行，且不使用 `PackageManager` 的簽名結果：
 
 1. 由 APK 尾端定位 v2/v3 signing block。
-2. 解析 signer 的 signed data、public key、signature 與 SHA-256 content digest。
+2. 解析 signer 的 signed data、public key、signature 與 SHA-256／SHA-512 content digest。
 3. 透過 JCA 驗證 signer 對 signed data 的 cryptographic signature。
-4. 依 v2/v3 chunked digest 規格重算 APK 受保護區段的 SHA-256 digest。
+4. 依 v2/v3 chunked digest 規格重算 APK 受保護區段的 SHA-256／SHA-512 digest。
 5. 任一步失敗即停止 loader，不載入真實 DEX。
 
 v2/v3 的內容保護涵蓋 ZIP entries、Central Directory、EOCD 與 signed data，因此殼 DEX、加密 payload、`lib/*.so`、Manifest 和受保護 asset 都在同一個完整性邊界內。若加固時啟用簽名綁定，loader 也會以目前 signer certificate hash 作為既有載荷的解密材料；換簽或竄改 signer 時無法取得正確載荷。
