@@ -226,7 +226,7 @@ bool ExtractSha256ContentDigest(const uint8_t *signers, size_t signersLength, ui
         const uint32_t algorithm = ReadU32(record);
         size_t digestValueOffset = 4; const uint8_t *digest = nullptr; size_t digestLength = 0;
         if (!ReadLengthPrefixed(record, recordLength, &digestValueOffset, &digest, &digestLength) || digestValueOffset != recordLength) return false;
-        if (digestLength == 32 && (algorithm == 0x0101U || algorithm == 0x0103U || algorithm == 0x0104U || algorithm == 0x0421U)) {
+        if (digestLength == 32 && (algorithm == 0x0101U || algorithm == 0x0103U || algorithm == 0x0201U || algorithm == 0x0301U)) {
             memcpy(outDigest, digest, 32); return true;
         }
     }
@@ -234,15 +234,15 @@ bool ExtractSha256ContentDigest(const uint8_t *signers, size_t signersLength, ui
 }
 
 const char *JcaKeyAlgorithm(uint32_t scheme) {
-    switch (scheme) { case 0x0101U: case 0x0102U: case 0x0421U: case 0x0422U: return "RSA"; case 0x0103U: case 0x0104U: return "EC"; case 0x0105U: case 0x0106U: return "DSA"; default: return nullptr; }
+    switch (scheme) { case 0x0101U: case 0x0102U: case 0x0103U: case 0x0104U: return "RSA"; case 0x0201U: case 0x0202U: return "EC"; case 0x0301U: return "DSA"; default: return nullptr; }
 }
 
 const char *JcaSignatureAlgorithm(uint32_t scheme) {
     switch (scheme) {
-        case 0x0101U: return "SHA256withRSA"; case 0x0102U: return "SHA512withRSA";
-        case 0x0103U: return "SHA256withECDSA"; case 0x0104U: return "SHA512withECDSA";
-        case 0x0105U: return "SHA256withDSA"; case 0x0106U: return "SHA512withDSA";
-        case 0x0421U: return "SHA256withRSA/PSS"; case 0x0422U: return "SHA512withRSA/PSS";
+        case 0x0101U: case 0x0102U: return "RSASSA-PSS";
+        case 0x0103U: return "SHA256withRSA"; case 0x0104U: return "SHA512withRSA";
+        case 0x0201U: return "SHA256withECDSA"; case 0x0202U: return "SHA512withECDSA";
+        case 0x0301U: return "SHA256withDSA";
         default: return nullptr;
     }
 }
@@ -277,6 +277,15 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     jmethodID generatePublic = env->GetMethodID(keyFactoryClass, "generatePublic", "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;"); jobject publicKeyObject = env->CallObjectMethod(factory, generatePublic, spec);
     jmethodID signatureGet = env->GetStaticMethodID(signatureClass, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;"); jstring signatureName = env->NewStringUTF(signatureAlgorithm); jobject verifier = env->CallStaticObjectMethod(signatureClass, signatureGet, signatureName);
     jmethodID initVerify = env->GetMethodID(signatureClass, "initVerify", "(Ljava/security/PublicKey;)V"); jmethodID update = env->GetMethodID(signatureClass, "update", "([B)V"); jmethodID verify = env->GetMethodID(signatureClass, "verify", "([B)Z");
+    if (scheme == 0x0101U || scheme == 0x0102U) {
+        const char *digestName = scheme == 0x0101U ? "SHA-256" : "SHA-512";
+        const jint saltLength = scheme == 0x0101U ? 32 : 64;
+        jclass mgfClass = env->FindClass("java/security/spec/MGF1ParameterSpec"); jclass pssClass = env->FindClass("java/security/spec/PSSParameterSpec");
+        jmethodID mgfInit = env->GetMethodID(mgfClass, "<init>", "(Ljava/lang/String;)V"); jobject mgf = env->NewObject(mgfClass, mgfInit, env->NewStringUTF(digestName));
+        jmethodID pssInit = env->GetMethodID(pssClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/security/spec/AlgorithmParameterSpec;II)V");
+        jobject pss = env->NewObject(pssClass, pssInit, env->NewStringUTF(digestName), env->NewStringUTF("MGF1"), mgf, saltLength, 1);
+        jmethodID setParameter = env->GetMethodID(signatureClass, "setParameter", "(Ljava/security/spec/AlgorithmParameterSpec;)V"); env->CallVoidMethod(verifier, setParameter, pss);
+    }
     env->CallVoidMethod(verifier, initVerify, publicKeyObject); env->CallVoidMethod(verifier, update, signedBytes); const jboolean verified = env->CallBooleanMethod(verifier, verify, signatureBytes);
     if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     return verified == JNI_TRUE;
