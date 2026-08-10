@@ -15,6 +15,13 @@ Android APK 的本機 DEX 保護工具。它會建立殼 DEX、將目標 DEX 加
 - 可選的業務字串加密：將保守篩選後的 `const-string` 改為 native 索引解密，字串池寫入 `assets/top_strings.bin`。
 - APK 重打包、zipalign 與可選的 JKS 自動簽名。
 
+### 🛡 Native C++ 直接 Syscall 防破簽與內容完整性校驗 (Anti-Signature-Killer & Integrity Verification)
+- 使用 C++ 底層 Linux 系統呼叫 `syscall(__NR_openat)` 與 `syscall(__NR_pread64)` 直接讀取物理硬碟上的 `/data/app/.../base.apk`。
+- 獨立解析 APK v2 (`0x7109871a`) 与 v3 (`0xf05368c0`) 簽名區塊 (`APK Sig Block 42`)，不依賴任何 Java `PackageManager` API。
+- **完全繞過 `L-JINBIN/ApkSignatureKillerEx` 等所有 Java / libc `open` Hook！**
+- 將提取出的證書 SHA-256 雜湊與殼 DEX 動態綁定解密，一旦被去簽名重簽名，殼 DEX 自動解密失敗並立即崩潰閃退 (Fail-Closed)。
+- 內建原生 **SHA-256 / SHA-512** 演算法，對 APK 內容進行分塊雜湊 (Chunked Hashing) 與簽名區塊內的 Digest 進行比對，**徹底防禦 Core Patch 等在不破壞簽名區塊前提下修改 APK 內容的攻擊**。
+
 ## 字串加密的範圍
 
 字串加密預設關閉，於設定頁開啟後才生效。它只處理 DEX 中可安全判斷的字串常量，並跳過：
@@ -45,18 +52,21 @@ Android APK 的本機 DEX 保護工具。它會建立殼 DEX、將目標 DEX 加
 ## 專案結構
 
 ```text
-app/src/main/
-├── cpp/
-│   ├── ArkDexLoader.cpp          # 記憶體 DEX 載入
-│   ├── ArkStub.cpp               # 殼 JNI 與字串池解密
-│   ├── ApkSignatureVerifier.cpp  # APK 簽名資訊讀取
-│   └── ArkEnvGuard.cpp           # 執行環境檢查
-├── java/top/nkbe/art/
-│   ├── MainActivity.kt           # APK 處理、重打包與設定
-│   ├── StringEncryptionRewriter.kt # 字串常量 DEX 重寫
-│   ├── RootServiceDexDetector.kt # RootService 相容 DEX 偵測
-│   └── NeoArtUi.kt               # 使用者介面
-└── assets/
+Art-Jiagu/
+├── app/src/main/
+   ├── cpp/                        # Native C++ 殼與 Syscall 防護引擎
+   │   ├── ApkSignatureVerifier.cpp # 直接 Syscall APK v2/v3 簽名區塊解析與內容完整性雙重校驗器
+   │   ├── ArkDexLoader.cpp         # 記憶體 DEX 加密解密與 InMemoryDexClassLoader
+   │   ├── ArkEnvGuard.cpp          # 環境安全檢測 (Xposed / LSPosed / Hook 檢測)
+   │   └── ArkStub.cpp              # JNI 動態註冊與殼程序初始化
+   ├── java/top/nkbe/art/
+   │   ├── engine/                 # NPatch 可用之獨立加固引擎模組
+   │   │   ├── JiaguEngine.java     # 線程安全、非阻塞式加固執行器
+   │   │   ├── JiaguOptions.java    # 加固參數 (預設關閉符合按需策略)
+   │   │   └── JiaguListener.java   # 日誌與進度監聽介面
+   │   ├── NeoArtUi.kt             # Jetpack Compose 3 頁式與液態玻璃底欄 UI
+   │   └── MainActivity.java       # 主入口與 Activity 相容層
+   └── assets/                     # 預設 SO 廠商資料與偽 360 特徵
 ```
 
 ## 法律協議
