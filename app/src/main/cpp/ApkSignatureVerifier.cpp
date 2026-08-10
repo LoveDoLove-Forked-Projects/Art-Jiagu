@@ -384,9 +384,13 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     if (keyBytes == nullptr || signedBytes == nullptr || signatureBytes == nullptr) { env->PopLocalFrame(nullptr); return false; }
     env->SetByteArrayRegion(keyBytes, 0, static_cast<jsize>(publicKeyLength), reinterpret_cast<const jbyte *>(publicKey)); env->SetByteArrayRegion(signedBytes, 0, static_cast<jsize>(signedDataLength), reinterpret_cast<const jbyte *>(signedData)); env->SetByteArrayRegion(signatureBytes, 0, static_cast<jsize>(signatureLength), reinterpret_cast<const jbyte *>(signature));
     jmethodID specInit = env->GetMethodID(specClass, "<init>", "([B)V"); jobject spec = env->NewObject(specClass, specInit, keyBytes);
+    if (env->ExceptionCheck() || spec == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID factoryGet = env->GetStaticMethodID(keyFactoryClass, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;"); jstring keyName = env->NewStringUTF(keyAlgorithm); jobject factory = env->CallStaticObjectMethod(keyFactoryClass, factoryGet, keyName);
+    if (env->ExceptionCheck() || factory == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID generatePublic = env->GetMethodID(keyFactoryClass, "generatePublic", "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;"); jobject publicKeyObject = env->CallObjectMethod(factory, generatePublic, spec);
+    if (env->ExceptionCheck() || publicKeyObject == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID signatureGet = env->GetStaticMethodID(signatureClass, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;"); jstring signatureName = env->NewStringUTF(signatureAlgorithm); jobject verifier = env->CallStaticObjectMethod(signatureClass, signatureGet, signatureName);
+    if (env->ExceptionCheck() || verifier == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID initVerify = env->GetMethodID(signatureClass, "initVerify", "(Ljava/security/PublicKey;)V"); jmethodID update = env->GetMethodID(signatureClass, "update", "([B)V"); jmethodID verify = env->GetMethodID(signatureClass, "verify", "([B)Z");
     if (scheme == 0x0101U || scheme == 0x0102U) {
         const char *digestName = scheme == 0x0101U ? "SHA-256" : "SHA-512";
@@ -410,7 +414,7 @@ bool HashChunk(int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 32>
             static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
             static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
     hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    std::array<uint8_t, 64 * 1024> buffer{};
+    std::vector<uint8_t> buffer(64 * 1024);
     uint64_t cursor = offset; uint32_t remaining = length;
     while (remaining > 0) {
         const size_t take = remaining < buffer.size() ? remaining : buffer.size();
@@ -433,7 +437,7 @@ bool HashChunkSha512(int fd, uint64_t offset, uint32_t length, std::array<uint8_
             static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
             static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
     hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    std::array<uint8_t, 64 * 1024> buffer{};
+    std::vector<uint8_t> buffer(64 * 1024);
     uint64_t cursor = offset; uint32_t remaining = length;
     while (remaining > 0) {
         const size_t take = remaining < buffer.size() ? remaining : buffer.size();
@@ -573,7 +577,7 @@ std::string GetSourceDirFromMaps() {
         }
         if (!foundPath.empty()) break;
     }
-    syscall(__NR_close, fd);
+    close(fd);
     return foundPath;
 }
 } // namespace
