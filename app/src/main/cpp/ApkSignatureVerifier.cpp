@@ -384,9 +384,13 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     if (keyBytes == nullptr || signedBytes == nullptr || signatureBytes == nullptr) { env->PopLocalFrame(nullptr); return false; }
     env->SetByteArrayRegion(keyBytes, 0, static_cast<jsize>(publicKeyLength), reinterpret_cast<const jbyte *>(publicKey)); env->SetByteArrayRegion(signedBytes, 0, static_cast<jsize>(signedDataLength), reinterpret_cast<const jbyte *>(signedData)); env->SetByteArrayRegion(signatureBytes, 0, static_cast<jsize>(signatureLength), reinterpret_cast<const jbyte *>(signature));
     jmethodID specInit = env->GetMethodID(specClass, "<init>", "([B)V"); jobject spec = env->NewObject(specClass, specInit, keyBytes);
+    if (env->ExceptionCheck() || spec == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID factoryGet = env->GetStaticMethodID(keyFactoryClass, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;"); jstring keyName = env->NewStringUTF(keyAlgorithm); jobject factory = env->CallStaticObjectMethod(keyFactoryClass, factoryGet, keyName);
+    if (env->ExceptionCheck() || factory == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID generatePublic = env->GetMethodID(keyFactoryClass, "generatePublic", "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;"); jobject publicKeyObject = env->CallObjectMethod(factory, generatePublic, spec);
+    if (env->ExceptionCheck() || publicKeyObject == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID signatureGet = env->GetStaticMethodID(signatureClass, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;"); jstring signatureName = env->NewStringUTF(signatureAlgorithm); jobject verifier = env->CallStaticObjectMethod(signatureClass, signatureGet, signatureName);
+    if (env->ExceptionCheck() || verifier == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID initVerify = env->GetMethodID(signatureClass, "initVerify", "(Ljava/security/PublicKey;)V"); jmethodID update = env->GetMethodID(signatureClass, "update", "([B)V"); jmethodID verify = env->GetMethodID(signatureClass, "verify", "([B)Z");
     if (scheme == 0x0101U || scheme == 0x0102U) {
         const char *digestName = scheme == 0x0101U ? "SHA-256" : "SHA-512";
@@ -405,17 +409,16 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     return true;
 }
 
-bool HashChunk(int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 32> *out) {
+bool HashChunk(int fd, uint64_t offset, uint32_t length, uint8_t* ioBuffer, size_t ioBufferSize, std::array<uint8_t, 32> *out) {
     Sha256 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
             static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
             static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
     hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    std::array<uint8_t, 64 * 1024> buffer{};
     uint64_t cursor = offset; uint32_t remaining = length;
     while (remaining > 0) {
-        const size_t take = remaining < buffer.size() ? remaining : buffer.size();
-        if (!RawReadAt(fd, cursor, buffer.data(), take)) return false;
-        hash.Update(buffer.data(), take); cursor += take; remaining -= static_cast<uint32_t>(take);
+        const size_t take = remaining < ioBufferSize ? remaining : ioBufferSize;
+        if (!RawReadAt(fd, cursor, ioBuffer, take)) return false;
+        hash.Update(ioBuffer, take); cursor += take; remaining -= static_cast<uint32_t>(take);
     }
     *out = hash.Final(); return true;
 }
@@ -428,17 +431,16 @@ bool HashMemoryChunk(const uint8_t *data, uint32_t length, std::array<uint8_t, 3
     hash.Update(&marker, 1); hash.Update(size, sizeof(size)); hash.Update(data, length); *out = hash.Final(); return true;
 }
 
-bool HashChunkSha512(int fd, uint64_t offset, uint32_t length, std::array<uint8_t, 64> *out) {
+bool HashChunkSha512(int fd, uint64_t offset, uint32_t length, uint8_t* ioBuffer, size_t ioBufferSize, std::array<uint8_t, 64> *out) {
     Sha512 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
             static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
             static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
     hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    std::array<uint8_t, 64 * 1024> buffer{};
     uint64_t cursor = offset; uint32_t remaining = length;
     while (remaining > 0) {
-        const size_t take = remaining < buffer.size() ? remaining : buffer.size();
-        if (!RawReadAt(fd, cursor, buffer.data(), take)) return false;
-        hash.Update(buffer.data(), take); cursor += take; remaining -= static_cast<uint32_t>(take);
+        const size_t take = remaining < ioBufferSize ? remaining : ioBufferSize;
+        if (!RawReadAt(fd, cursor, ioBuffer, take)) return false;
+        hash.Update(ioBuffer, take); cursor += take; remaining -= static_cast<uint32_t>(take);
     }
     *out = hash.Final(); return true;
 }
@@ -475,16 +477,23 @@ bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
     std::vector<std::array<uint8_t, 64>> sha512Chunks;
     const uint64_t chunkSize = 1024U * 1024U;
     
+    const uint64_t totalDataToHash = blockOffset + (eocdOffset - centralDirectoryOffset);
+    const size_t estimatedChunks = static_cast<size_t>((totalDataToHash + chunkSize - 1) / chunkSize);
+    if (!useSha512) chunks.reserve(estimatedChunks + 1);
+    else sha512Chunks.reserve(estimatedChunks + 1);
+
+    std::vector<uint8_t> ioBuffer(64 * 1024);
+    
     auto appendSection = [&](uint64_t offset, uint64_t length) -> bool {
         while (length > 0) {
             const uint32_t take = static_cast<uint32_t>(length < chunkSize ? length : chunkSize);
             if (!useSha512) {
                 std::array<uint8_t, 32> digest{};
-                if (!HashChunk(fd, offset, take, &digest)) return false;
+                if (!HashChunk(fd, offset, take, ioBuffer.data(), ioBuffer.size(), &digest)) return false;
                 chunks.push_back(digest);
             } else {
                 std::array<uint8_t, 64> digest{};
-                if (!HashChunkSha512(fd, offset, take, &digest)) return false;
+                if (!HashChunkSha512(fd, offset, take, ioBuffer.data(), ioBuffer.size(), &digest)) return false;
                 sha512Chunks.push_back(digest);
             }
             offset += take; length -= take;
@@ -573,7 +582,7 @@ std::string GetSourceDirFromMaps() {
         }
         if (!foundPath.empty()) break;
     }
-    syscall(__NR_close, fd);
+    close(fd);
     return foundPath;
 }
 } // namespace
