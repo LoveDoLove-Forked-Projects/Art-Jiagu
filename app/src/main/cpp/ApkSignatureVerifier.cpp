@@ -12,48 +12,67 @@
 #include <vector>
 
 namespace {
+
+// ─── APK signing-block constants ──────────────────────────────────────────────
 constexpr uint32_t kApkSignatureSchemeV2BlockId = 0x7109871aU;
 constexpr uint32_t kApkSignatureSchemeV3BlockId = 0xf05368c0U;
-constexpr size_t kEocdMinSize = 22;
-constexpr size_t kMaxEocdSearch = 0xffff + kEocdMinSize;
-constexpr char kSigningBlockMagic[] = "APK Sig Block 42";
+constexpr size_t   kEocdMinSize   = 22;
+constexpr size_t   kMaxEocdSearch = 0xffff + kEocdMinSize;
+constexpr char     kSigningBlockMagic[] = "APK Sig Block 42";
 
-uint32_t ReadU32(const uint8_t *data) {
-    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8U) |
-           (static_cast<uint32_t>(data[2]) << 16U) | (static_cast<uint32_t>(data[3]) << 24U);
+// ─── Primitive read / write helpers ──────────────────────────────────────────
+static inline uint16_t ReadU16(const uint8_t *p) {
+    return static_cast<uint16_t>(p[0]) |
+           static_cast<uint16_t>(static_cast<uint16_t>(p[1]) << 8U);
 }
 
-uint16_t ReadU16(const uint8_t *data) {
-    return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8U);
+static inline uint32_t ReadU32(const uint8_t *p) {
+    return  static_cast<uint32_t>(p[0])        |
+           (static_cast<uint32_t>(p[1]) << 8U)  |
+           (static_cast<uint32_t>(p[2]) << 16U) |
+           (static_cast<uint32_t>(p[3]) << 24U);
 }
 
-uint64_t ReadU64(const uint8_t *data) {
-    uint64_t value = 0;
-    for (size_t i = 0; i < 8; ++i) value |= static_cast<uint64_t>(data[i]) << (i * 8U);
-    return value;
+static inline uint64_t ReadU64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[i]) << (i * 8U);
+    return v;
 }
 
-bool ReadLengthPrefixed(const uint8_t *data, size_t limit, size_t *offset,
-                        const uint8_t **value, size_t *length) {
-    if (data == nullptr || offset == nullptr || value == nullptr || length == nullptr ||
-        *offset > limit || limit - *offset < 4) return false;
+// Write 'value' as a 4-byte little-endian uint32 into out[0..3].
+static inline void WriteU32LE(uint8_t out[4], uint32_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8U);
+    out[2] = static_cast<uint8_t>(value >> 16U);
+    out[3] = static_cast<uint8_t>(value >> 24U);
+}
+
+// Parse a 4-byte length-prefixed record from data[0..limit).
+// On success advances *offset past the record and sets *value/*length.
+static bool ReadLengthPrefixed(const uint8_t *data, size_t limit, size_t *offset,
+                                const uint8_t **value, size_t *length) {
+    if (data == nullptr || offset == nullptr || value == nullptr || length == nullptr)
+        return false;
+    if (*offset > limit || limit - *offset < 4)
+        return false;
     const uint32_t size = ReadU32(data + *offset);
     *offset += 4;
     if (size > limit - *offset) return false;
-    *value = data + *offset;
+    *value  = data + *offset;
     *length = size;
     *offset += size;
     return true;
 }
 
-bool RawReadAt(int fd, uint64_t offset, void *buffer, size_t length) {
+// Syscall-based pread loop; bypasses any libc/hook layer.
+static bool RawReadAt(int fd, uint64_t offset, void *buffer, size_t length) {
     auto *bytes = static_cast<uint8_t *>(buffer);
     size_t done = 0;
     while (done < length) {
-        const ssize_t count = static_cast<ssize_t>(syscall(__NR_pread64, fd, bytes + done,
-                                                            length - done, offset + done));
-        if (count <= 0) return false;
-        done += static_cast<size_t>(count);
+        const ssize_t n = static_cast<ssize_t>(
+            syscall(__NR_pread64, fd, bytes + done, length - done, offset + done));
+        if (n <= 0) return false;
+        done += static_cast<size_t>(n);
     }
     return true;
 }
