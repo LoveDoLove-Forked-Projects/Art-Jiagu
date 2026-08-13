@@ -460,48 +460,75 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     return true;
 }
 
-bool HashChunk(int fd, uint64_t offset, uint32_t length, uint8_t* ioBuffer, size_t ioBufferSize, std::array<uint8_t, 32> *out) {
-    Sha256 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
-            static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
-            static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
-    hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    uint64_t cursor = offset; uint32_t remaining = length;
+// ─── APK v2/v3 chunk-hashing helpers ─────────────────────────────────────────
+// Feed the mandatory 5-byte chunk header (0xa5 || LE-u32 length) into a hasher.
+template<typename H>
+static void FeedChunkHeader(H &h, uint32_t length) {
+    static constexpr uint8_t kLeafMarker = 0xa5;
+    uint8_t sizeLE[4]{};
+    WriteU32LE(sizeLE, length);
+    h.Update(&kLeafMarker, 1);
+    h.Update(sizeLE, sizeof(sizeLE));
+}
+
+// Hash a file region from [offset, offset+length) as a single APK leaf chunk (SHA-256).
+static bool HashChunk(int fd, uint64_t offset, uint32_t length,
+                      uint8_t *ioBuffer, size_t ioBufferSize,
+                      std::array<uint8_t, 32> *out) {
+    Sha256 hash;
+    FeedChunkHeader(hash, length);
+    uint64_t cursor    = offset;
+    uint32_t remaining = length;
     while (remaining > 0) {
         const size_t take = remaining < ioBufferSize ? remaining : ioBufferSize;
         if (!RawReadAt(fd, cursor, ioBuffer, take)) return false;
-        hash.Update(ioBuffer, take); cursor += take; remaining -= static_cast<uint32_t>(take);
+        hash.Update(ioBuffer, take);
+        cursor    += take;
+        remaining -= static_cast<uint32_t>(take);
     }
-    *out = hash.Final(); return true;
+    *out = hash.Final();
+    return true;
 }
 
-bool HashMemoryChunk(const uint8_t *data, uint32_t length, std::array<uint8_t, 32> *out) {
+// Hash an in-memory buffer as a single APK leaf chunk (SHA-256).
+static bool HashMemoryChunk(const uint8_t *data, uint32_t length,
+                            std::array<uint8_t, 32> *out) {
     if (data == nullptr) return false;
-    Sha256 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
-            static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
-            static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
-    hash.Update(&marker, 1); hash.Update(size, sizeof(size)); hash.Update(data, length); *out = hash.Final(); return true;
+    Sha256 hash;
+    FeedChunkHeader(hash, length);
+    hash.Update(data, length);
+    *out = hash.Final();
+    return true;
 }
 
-bool HashChunkSha512(int fd, uint64_t offset, uint32_t length, uint8_t* ioBuffer, size_t ioBufferSize, std::array<uint8_t, 64> *out) {
-    Sha512 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
-            static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
-            static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
-    hash.Update(&marker, 1); hash.Update(size, sizeof(size));
-    uint64_t cursor = offset; uint32_t remaining = length;
+// Hash a file region from [offset, offset+length) as a single APK leaf chunk (SHA-512).
+static bool HashChunkSha512(int fd, uint64_t offset, uint32_t length,
+                            uint8_t *ioBuffer, size_t ioBufferSize,
+                            std::array<uint8_t, 64> *out) {
+    Sha512 hash;
+    FeedChunkHeader(hash, length);
+    uint64_t cursor    = offset;
+    uint32_t remaining = length;
     while (remaining > 0) {
         const size_t take = remaining < ioBufferSize ? remaining : ioBufferSize;
         if (!RawReadAt(fd, cursor, ioBuffer, take)) return false;
-        hash.Update(ioBuffer, take); cursor += take; remaining -= static_cast<uint32_t>(take);
+        hash.Update(ioBuffer, take);
+        cursor    += take;
+        remaining -= static_cast<uint32_t>(take);
     }
-    *out = hash.Final(); return true;
+    *out = hash.Final();
+    return true;
 }
 
-bool HashMemoryChunkSha512(const uint8_t *data, uint32_t length, std::array<uint8_t, 64> *out) {
+// Hash an in-memory buffer as a single APK leaf chunk (SHA-512).
+static bool HashMemoryChunkSha512(const uint8_t *data, uint32_t length,
+                                  std::array<uint8_t, 64> *out) {
     if (data == nullptr) return false;
-    Sha512 hash; const uint8_t marker = 0xa5; uint8_t size[4] = {
-            static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8U),
-            static_cast<uint8_t>(length >> 16U), static_cast<uint8_t>(length >> 24U)};
-    hash.Update(&marker, 1); hash.Update(size, sizeof(size)); hash.Update(data, length); *out = hash.Final(); return true;
+    Sha512 hash;
+    FeedChunkHeader(hash, length);
+    hash.Update(data, length);
+    *out = hash.Final();
+    return true;
 }
 
 bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
