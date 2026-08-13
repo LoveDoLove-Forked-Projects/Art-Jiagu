@@ -359,7 +359,7 @@ const char *JcaSignatureAlgorithm(uint32_t scheme) {
 bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLength,
                            uint32_t *verifiedScheme) {
     if (env == nullptr || verifiedScheme == nullptr) return false;
-    if (env->PushLocalFrame(16) < 0) return false;
+    if (env->PushLocalFrame(32) < 0) return false;
     size_t outerOffset = 0, signerOffset = 0, signerFieldsOffset = 0, signatureOffset = 0, keyOffset = 0;
     const uint8_t *outer = nullptr, *signer = nullptr, *signedData = nullptr, *signatures = nullptr, *publicKey = nullptr;
     size_t outerLength = 0, signerLength = 0, signedDataLength = 0, signaturesLength = 0, publicKeyLength = 0;
@@ -377,7 +377,8 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
         if (JcaSignatureAlgorithm(candidate) != nullptr) { scheme = candidate; signature = value; signatureLength = length; break; }
     }
     const char *keyAlgorithm = JcaKeyAlgorithm(scheme); const char *signatureAlgorithm = JcaSignatureAlgorithm(scheme);
-    if (keyAlgorithm == nullptr || signatureAlgorithm == nullptr) { env->PopLocalFrame(nullptr); return false; }
+    // scheme==0 means no recognized algorithm was found; signature ptr is nullptr, bail early.
+    if (keyAlgorithm == nullptr || signatureAlgorithm == nullptr || signature == nullptr) { env->PopLocalFrame(nullptr); return false; }
     jclass specClass = env->FindClass("java/security/spec/X509EncodedKeySpec"); jclass keyFactoryClass = env->FindClass("java/security/KeyFactory"); jclass signatureClass = env->FindClass("java/security/Signature");
     if (specClass == nullptr || keyFactoryClass == nullptr || signatureClass == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jbyteArray keyBytes = env->NewByteArray(static_cast<jsize>(publicKeyLength)); jbyteArray signedBytes = env->NewByteArray(static_cast<jsize>(signedDataLength)); jbyteArray signatureBytes = env->NewByteArray(static_cast<jsize>(signatureLength));
@@ -392,14 +393,19 @@ bool VerifySignerSignature(JNIEnv *env, const uint8_t *signers, size_t signersLe
     jmethodID signatureGet = env->GetStaticMethodID(signatureClass, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;"); jstring signatureName = env->NewStringUTF(signatureAlgorithm); jobject verifier = env->CallStaticObjectMethod(signatureClass, signatureGet, signatureName);
     if (env->ExceptionCheck() || verifier == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     jmethodID initVerify = env->GetMethodID(signatureClass, "initVerify", "(Ljava/security/PublicKey;)V"); jmethodID update = env->GetMethodID(signatureClass, "update", "([B)V"); jmethodID verify = env->GetMethodID(signatureClass, "verify", "([B)Z");
+    if (initVerify == nullptr || update == nullptr || verify == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     if (scheme == 0x0101U || scheme == 0x0102U) {
         const char *digestName = scheme == 0x0101U ? "SHA-256" : "SHA-512";
         const jint saltLength = scheme == 0x0101U ? 32 : 64;
         jclass mgfClass = env->FindClass("java/security/spec/MGF1ParameterSpec"); jclass pssClass = env->FindClass("java/security/spec/PSSParameterSpec");
+        if (mgfClass == nullptr || pssClass == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
         jmethodID mgfInit = env->GetMethodID(mgfClass, "<init>", "(Ljava/lang/String;)V"); jobject mgf = env->NewObject(mgfClass, mgfInit, env->NewStringUTF(digestName));
+        if (env->ExceptionCheck() || mgf == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
         jmethodID pssInit = env->GetMethodID(pssClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/security/spec/AlgorithmParameterSpec;II)V");
         jobject pss = env->NewObject(pssClass, pssInit, env->NewStringUTF(digestName), env->NewStringUTF("MGF1"), mgf, saltLength, 1);
+        if (env->ExceptionCheck() || pss == nullptr) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
         jmethodID setParameter = env->GetMethodID(signatureClass, "setParameter", "(Ljava/security/spec/AlgorithmParameterSpec;)V"); env->CallVoidMethod(verifier, setParameter, pss);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
     }
     env->CallVoidMethod(verifier, initVerify, publicKeyObject); env->CallVoidMethod(verifier, update, signedBytes); const jboolean verified = env->CallBooleanMethod(verifier, verify, signatureBytes);
     if (env->ExceptionCheck()) { env->ExceptionClear(); env->PopLocalFrame(nullptr); return false; }
