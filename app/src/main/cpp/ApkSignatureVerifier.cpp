@@ -533,78 +533,156 @@ static bool HashMemoryChunkSha512(const uint8_t *data, uint32_t length,
 
 bool VerifyContentDigestFromFile(JNIEnv *env, const std::string &apkPath) {
     const int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, apkPath.c_str(), O_RDONLY | O_CLOEXEC, 0));
-    struct stat statInfo{}; if (fd < 0 || fstat(fd, &statInfo) != 0 || statInfo.st_size < static_cast<off_t>(kEocdMinSize)) { if (fd >= 0) close(fd); return false; }
-    const uint64_t fileSize = static_cast<uint64_t>(statInfo.st_size); const size_t tailSize = static_cast<size_t>(fileSize < kMaxEocdSearch ? fileSize : kMaxEocdSearch);
-    std::vector<uint8_t> tail(tailSize); if (!RawReadAt(fd, fileSize - tailSize, tail.data(), tailSize)) { close(fd); return false; }
-    size_t eocdInTail = tailSize - kEocdMinSize; bool found = false;
-    for (;;) { if (ReadU32(tail.data() + eocdInTail) == 0x06054b50U && eocdInTail + kEocdMinSize + ReadU16(tail.data() + eocdInTail + 20) == tailSize) { found = true; break; } if (eocdInTail == 0) break; --eocdInTail; }
+    if (fd < 0) return false;
+
+    // ── 1. Stat + read tail for EOCD search ──────────────────────────────────
+    struct stat statInfo{};
+    if (fstat(fd, &statInfo) != 0 || statInfo.st_size < static_cast<off_t>(kEocdMinSize)) {
+        close(fd); return false;
+    }
+    const uint64_t fileSize  = static_cast<uint64_t>(statInfo.st_size);
+    const size_t   tailSize  = static_cast<size_t>(fileSize < kMaxEocdSearch ? fileSize : kMaxEocdSearch);
+    std::vector<uint8_t> tail(tailSize);
+    if (!RawReadAt(fd, fileSize - tailSize, tail.data(), tailSize)) { close(fd); return false; }
+
+    // ── 2. Locate EOCD record ─────────────────────────────────────────────────
+    size_t eocdInTail = tailSize - kEocdMinSize;
+    bool found = false;
+    for (;;) {
+        const bool sigOk  = ReadU32(tail.data() + eocdInTail) == 0x06054b50U;
+        const bool sizeOk = eocdInTail + kEocdMinSize + ReadU16(tail.data() + eocdInTail + 20) == tailSize;
+        if (sigOk && sizeOk) { found = true; break; }
+        if (eocdInTail == 0) break;
+        --eocdInTail;
+    }
     if (!found) { close(fd); return false; }
-    const uint64_t eocdOffset = fileSize - tailSize + eocdInTail; const uint64_t centralDirectoryOffset = ReadU32(tail.data() + eocdInTail + 16);
-    uint8_t footer[24]{}; if (centralDirectoryOffset < 24 || !RawReadAt(fd, centralDirectoryOffset - 24, footer, 24) || memcmp(footer + 8, kSigningBlockMagic, sizeof(kSigningBlockMagic) - 1) != 0) { close(fd); return false; }
+
+    const uint64_t eocdOffset              = fileSize - tailSize + eocdInTail;
+    const uint64_t centralDirectoryOffset  = ReadU32(tail.data() + eocdInTail + 16);
+
+    // ── 3. Locate and validate APK Signing Block ──────────────────────────────
+    if (centralDirectoryOffset < 24) { close(fd); return false; }
+    uint8_t footer[24]{};
+    if (!RawReadAt(fd, centralDirectoryOffset - 24, footer, 24) ||
+        memcmp(footer + 8, kSigningBlockMagic, sizeof(kSigningBlockMagic) - 1) != 0) {
+        close(fd); return false;
+    }
     const uint64_t blockSize = ReadU64(footer);
-    if (blockSize < 24 || blockSize > centralDirectoryOffset - 8 || blockSize > 16U * 1024U * 1024U) { close(fd); return false; }
+    if (blockSize < 24 || blockSize > centralDirectoryOffset - 8 ||
+        blockSize > 16U * 1024U * 1024U) { close(fd); return false; }
+
     const uint64_t blockOffset = centralDirectoryOffset - blockSize - 8;
     std::vector<uint8_t> block(static_cast<size_t>(blockSize + 8));
-    if (!RawReadAt(fd, blockOffset, block.data(), block.size()) || ReadU64(block.data()) != blockSize) { close(fd); return false; }
-    const uint8_t *scheme = nullptr; size_t schemeLength = 0; size_t entryOffset = 8; const size_t entriesEnd = block.size() - 24;
-    while (entryOffset < entriesEnd) { if (entriesEnd - entryOffset < 12) { close(fd); return false; } const uint64_t length = ReadU64(block.data() + entryOffset); entryOffset += 8; if (length < 4 || length > entriesEnd - entryOffset) { close(fd); return false; } const uint32_t id = ReadU32(block.data() + entryOffset); if (id == kApkSignatureSchemeV3BlockId || (scheme == nullptr && id == kApkSignatureSchemeV2BlockId)) { scheme = block.data() + entryOffset + 4; schemeLength = static_cast<size_t>(length - 4); } entryOffset += static_cast<size_t>(length); }
-    if (entryOffset != entriesEnd) { close(fd); return false; }
-    std::vector<uint8_t> expected; bool useSha512 = false; uint32_t verifiedScheme = 0;
-    if (scheme == nullptr || !VerifySignerSignature(env, scheme, schemeLength, &verifiedScheme) || !ExtractContentDigest(scheme, schemeLength, verifiedScheme, &expected, &useSha512)) { close(fd); return false; }
+    if (!RawReadAt(fd, blockOffset, block.data(), block.size()) ||
+        ReadU64(block.data()) != blockSize) { close(fd); return false; }
+
+    // ── 4. Find v2/v3 signature scheme entry ─────────────────────────────────
+    const uint8_t *scheme    = nullptr;
+    size_t         schemeLen = 0;
+    size_t         entryOff  = 8;
+    const size_t   entriesEnd = block.size() - 24;
+    while (entryOff < entriesEnd) {
+        if (entriesEnd - entryOff < 12) { close(fd); return false; }
+        const uint64_t entryLen = ReadU64(block.data() + entryOff);
+        entryOff += 8;
+        if (entryLen < 4 || entryLen > entriesEnd - entryOff) { close(fd); return false; }
+        const uint32_t id = ReadU32(block.data() + entryOff);
+        if (id == kApkSignatureSchemeV3BlockId ||
+            (scheme == nullptr && id == kApkSignatureSchemeV2BlockId)) {
+            scheme    = block.data() + entryOff + 4;
+            schemeLen = static_cast<size_t>(entryLen - 4);
+        }
+        entryOff += static_cast<size_t>(entryLen);
+    }
+    if (entryOff != entriesEnd) { close(fd); return false; }
+
+    // ── 5. Verify signer signature and extract expected content digest ────────
+    std::vector<uint8_t> expected;
+    bool     useSha512     = false;
+    uint32_t verifiedScheme = 0;
+    if (scheme == nullptr ||
+        !VerifySignerSignature(env, scheme, schemeLen, &verifiedScheme) ||
+        !ExtractContentDigest(scheme, schemeLen, verifiedScheme, &expected, &useSha512)) {
+        close(fd); return false;
+    }
+
+    // ── 6. Hash all APK sections (Before SB | CD | EOCD) ─────────────────────
+    constexpr uint64_t kChunkSize = 1024U * 1024U;
+    const uint64_t totalData      = blockOffset + (eocdOffset - centralDirectoryOffset);
+    const size_t   chunkCount     = static_cast<size_t>((totalData + kChunkSize - 1) / kChunkSize);
+
     std::vector<std::array<uint8_t, 32>> chunks;
     std::vector<std::array<uint8_t, 64>> sha512Chunks;
-    const uint64_t chunkSize = 1024U * 1024U;
-    
-    const uint64_t totalDataToHash = blockOffset + (eocdOffset - centralDirectoryOffset);
-    const size_t estimatedChunks = static_cast<size_t>((totalDataToHash + chunkSize - 1) / chunkSize);
-    if (!useSha512) chunks.reserve(estimatedChunks + 1);
-    else sha512Chunks.reserve(estimatedChunks + 1);
+    if (!useSha512) chunks.reserve(chunkCount + 1);
+    else            sha512Chunks.reserve(chunkCount + 1);
 
     std::vector<uint8_t> ioBuffer(64 * 1024);
-    
-    auto appendSection = [&](uint64_t offset, uint64_t length) -> bool {
-        while (length > 0) {
-            const uint32_t take = static_cast<uint32_t>(length < chunkSize ? length : chunkSize);
+
+    auto appendSection = [&](uint64_t off, uint64_t len) -> bool {
+        while (len > 0) {
+            const uint32_t take = static_cast<uint32_t>(len < kChunkSize ? len : kChunkSize);
             if (!useSha512) {
-                std::array<uint8_t, 32> digest{};
-                if (!HashChunk(fd, offset, take, ioBuffer.data(), ioBuffer.size(), &digest)) return false;
-                chunks.push_back(digest);
+                std::array<uint8_t, 32> d{};
+                if (!HashChunk(fd, off, take, ioBuffer.data(), ioBuffer.size(), &d)) return false;
+                chunks.push_back(d);
             } else {
-                std::array<uint8_t, 64> digest{};
-                if (!HashChunkSha512(fd, offset, take, ioBuffer.data(), ioBuffer.size(), &digest)) return false;
-                sha512Chunks.push_back(digest);
+                std::array<uint8_t, 64> d{};
+                if (!HashChunkSha512(fd, off, take, ioBuffer.data(), ioBuffer.size(), &d)) return false;
+                sha512Chunks.push_back(d);
             }
-            offset += take; length -= take;
+            off += take; len -= take;
         }
         return true;
     };
-    bool ok = appendSection(0, blockOffset) && appendSection(centralDirectoryOffset, eocdOffset - centralDirectoryOffset);
+
+    bool ok = appendSection(0, blockOffset) &&
+              appendSection(centralDirectoryOffset, eocdOffset - centralDirectoryOffset);
+
+    // Patch EOCD: replace CD offset field with the block offset (standard v2/v3 spec).
     std::vector<uint8_t> eocd(tail.begin() + eocdInTail, tail.end());
-    if (eocd.size() < 20) ok = false;
-    else { const uint32_t patched = static_cast<uint32_t>(blockOffset); eocd[16] = patched; eocd[17] = patched >> 8U; eocd[18] = patched >> 16U; eocd[19] = patched >> 24U; }
-    
+    if (eocd.size() < 20) {
+        ok = false;
+    } else {
+        uint8_t patchedOffset[4]{};
+        WriteU32LE(patchedOffset, static_cast<uint32_t>(blockOffset));
+        eocd[16] = patchedOffset[0]; eocd[17] = patchedOffset[1];
+        eocd[18] = patchedOffset[2]; eocd[19] = patchedOffset[3];
+    }
+
+    // ── 7. Compute and compare root digest ───────────────────────────────────
+    static constexpr uint8_t kRootMarker = 0x5a;
     if (ok && !useSha512) {
         std::array<uint8_t, 32> eocdDigest{};
         ok = HashMemoryChunk(eocd.data(), static_cast<uint32_t>(eocd.size()), &eocdDigest);
         if (ok) {
             chunks.push_back(eocdDigest);
-            const uint8_t marker = 0x5a; const uint32_t chunkCount = static_cast<uint32_t>(chunks.size());
-            uint8_t count[4] = {static_cast<uint8_t>(chunkCount), static_cast<uint8_t>(chunkCount >> 8U), static_cast<uint8_t>(chunkCount >> 16U), static_cast<uint8_t>(chunkCount >> 24U)};
-            Sha256 root; root.Update(&marker, 1); root.Update(count, 4); for (const auto &chunk : chunks) root.Update(chunk.data(), chunk.size());
-            const auto actual = root.Final(); ok = expected.size() == actual.size() && memcmp(actual.data(), expected.data(), actual.size()) == 0;
+            const uint32_t n = static_cast<uint32_t>(chunks.size());
+            uint8_t countLE[4]{}; WriteU32LE(countLE, n);
+            Sha256 root;
+            root.Update(&kRootMarker, 1); root.Update(countLE, 4);
+            for (const auto &c : chunks) root.Update(c.data(), c.size());
+            const auto actual = root.Final();
+            ok = (expected.size() == actual.size()) &&
+                 (memcmp(actual.data(), expected.data(), actual.size()) == 0);
         }
     } else if (ok && useSha512) {
         std::array<uint8_t, 64> eocdDigest{};
         ok = HashMemoryChunkSha512(eocd.data(), static_cast<uint32_t>(eocd.size()), &eocdDigest);
         if (ok) {
             sha512Chunks.push_back(eocdDigest);
-            const uint8_t marker = 0x5a; const uint32_t chunkCount = static_cast<uint32_t>(sha512Chunks.size());
-            uint8_t count[4] = {static_cast<uint8_t>(chunkCount), static_cast<uint8_t>(chunkCount >> 8U), static_cast<uint8_t>(chunkCount >> 16U), static_cast<uint8_t>(chunkCount >> 24U)};
-            Sha512 root; root.Update(&marker, 1); root.Update(count, 4); for (const auto &chunk : sha512Chunks) root.Update(chunk.data(), chunk.size());
-            const auto actual = root.Final(); ok = expected.size() == actual.size() && memcmp(actual.data(), expected.data(), actual.size()) == 0;
+            const uint32_t n = static_cast<uint32_t>(sha512Chunks.size());
+            uint8_t countLE[4]{}; WriteU32LE(countLE, n);
+            Sha512 root;
+            root.Update(&kRootMarker, 1); root.Update(countLE, 4);
+            for (const auto &c : sha512Chunks) root.Update(c.data(), c.size());
+            const auto actual = root.Final();
+            ok = (expected.size() == actual.size()) &&
+                 (memcmp(actual.data(), expected.data(), actual.size()) == 0);
         }
     }
-    close(fd); return ok;
+
+    close(fd);
+    return ok;
 }
 
 std::string GetSourceDirFromJni(JNIEnv *env, jobject context) {
