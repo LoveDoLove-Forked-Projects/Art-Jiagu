@@ -77,129 +77,156 @@ static bool RawReadAt(int fd, uint64_t offset, void *buffer, size_t length) {
     return true;
 }
 
+// ─── Pure-C++ SHA-256 implementation (no OpenSSL dependency) ─────────────────
 class Sha256 {
 public:
     Sha256() { Reset(); }
+
     void Update(const uint8_t *data, size_t length) {
         if (data == nullptr) return;
         total_ += length;
         while (length > 0) {
             const size_t take = length < (64 - used_) ? length : (64 - used_);
             memcpy(block_.data() + used_, data, take);
-            used_ += take;
-            data += take;
-            length -= take;
+            used_   += take;
+            data    += take;
+            length  -= take;
             if (used_ == 64) { Transform(block_.data()); used_ = 0; }
         }
     }
+
     std::array<uint8_t, 32> Final() {
-        const uint64_t bits = total_ * 8U;
-        const uint8_t marker = 0x80;
-        Update(&marker, 1);
+        const uint64_t bitLen = total_ * 8U;
+        // SHA-256 padding: 0x80, zeroes, 8-byte big-endian bit length
+        const uint8_t pad = 0x80;
+        Update(&pad, 1);
         const uint8_t zero = 0;
         while (used_ != 56) Update(&zero, 1);
-        uint8_t lengthBytes[8]{};
-        for (size_t i = 0; i < 8; ++i) lengthBytes[7 - i] = static_cast<uint8_t>(bits >> (i * 8U));
-        Update(lengthBytes, sizeof(lengthBytes));
+        uint8_t lenBytes[8]{};
+        for (size_t i = 0; i < 8; ++i)
+            lenBytes[7 - i] = static_cast<uint8_t>(bitLen >> (i * 8U));
+        Update(lenBytes, sizeof(lenBytes));
+        // Serialise state as big-endian bytes
         std::array<uint8_t, 32> digest{};
         for (size_t i = 0; i < state_.size(); ++i) {
-            digest[i * 4] = static_cast<uint8_t>(state_[i] >> 24U);
+            digest[i * 4 + 0] = static_cast<uint8_t>(state_[i] >> 24U);
             digest[i * 4 + 1] = static_cast<uint8_t>(state_[i] >> 16U);
-            digest[i * 4 + 2] = static_cast<uint8_t>(state_[i] >> 8U);
+            digest[i * 4 + 2] = static_cast<uint8_t>(state_[i] >>  8U);
             digest[i * 4 + 3] = static_cast<uint8_t>(state_[i]);
         }
         return digest;
     }
+
 private:
-    static uint32_t RotateRight(uint32_t value, uint32_t count) {
-        return (value >> count) | (value << (32U - count));
-    }
+    static uint32_t Rotr32(uint32_t v, uint32_t n) { return (v >> n) | (v << (32U - n)); }
+
     void Reset() {
         state_ = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
                   0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
         total_ = 0; used_ = 0;
     }
-    void Transform(const uint8_t *block) {
-        static constexpr uint32_t k[] = {
-                0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,
-                0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,
-                0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,
-                0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,
-                0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,
-                0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,
-                0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,
-                0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U};
-        uint32_t words[64]{};
-        for (size_t i = 0; i < 16; ++i) words[i] = (static_cast<uint32_t>(block[i * 4]) << 24U) |
-                (static_cast<uint32_t>(block[i * 4 + 1]) << 16U) |
-                (static_cast<uint32_t>(block[i * 4 + 2]) << 8U) | block[i * 4 + 3];
+
+    void Transform(const uint8_t *blk) {
+        static constexpr uint32_t K[64] = {
+            0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+            0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+            0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+            0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+            0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+            0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+            0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+            0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+            0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+            0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+            0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+            0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+            0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+            0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+            0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+            0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+        };
+        uint32_t W[64]{};
+        for (size_t i = 0; i < 16; ++i)
+            W[i] = (static_cast<uint32_t>(blk[i*4])   << 24U) |
+                   (static_cast<uint32_t>(blk[i*4+1]) << 16U) |
+                   (static_cast<uint32_t>(blk[i*4+2]) <<  8U) |
+                    static_cast<uint32_t>(blk[i*4+3]);
         for (size_t i = 16; i < 64; ++i) {
-            const uint32_t s0 = RotateRight(words[i - 15], 7) ^ RotateRight(words[i - 15], 18) ^ (words[i - 15] >> 3U);
-            const uint32_t s1 = RotateRight(words[i - 2], 17) ^ RotateRight(words[i - 2], 19) ^ (words[i - 2] >> 10U);
-            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+            const uint32_t s0 = Rotr32(W[i-15],  7) ^ Rotr32(W[i-15], 18) ^ (W[i-15] >>  3U);
+            const uint32_t s1 = Rotr32(W[i- 2], 17) ^ Rotr32(W[i- 2], 19) ^ (W[i- 2] >> 10U);
+            W[i] = W[i-16] + s0 + W[i-7] + s1;
         }
-        uint32_t a=state_[0], b=state_[1], c=state_[2], d=state_[3], e=state_[4], f=state_[5], g=state_[6], h=state_[7];
+        uint32_t a=state_[0], b=state_[1], c=state_[2], d=state_[3],
+                 e=state_[4], f=state_[5], g=state_[6], h=state_[7];
         for (size_t i = 0; i < 64; ++i) {
-            const uint32_t s1 = RotateRight(e, 6) ^ RotateRight(e, 11) ^ RotateRight(e, 25);
-            const uint32_t choose = (e & f) ^ (~e & g);
-            const uint32_t temp1 = h + s1 + choose + k[i] + words[i];
-            const uint32_t s0 = RotateRight(a, 2) ^ RotateRight(a, 13) ^ RotateRight(a, 22);
-            const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-            const uint32_t temp2 = s0 + majority;
-            h=g; g=f; f=e; e=d+temp1; d=c; c=b; b=a; a=temp1+temp2;
+            const uint32_t S1  = Rotr32(e,  6) ^ Rotr32(e, 11) ^ Rotr32(e, 25);
+            const uint32_t ch  = (e & f) ^ (~e & g);
+            const uint32_t t1  = h + S1 + ch + K[i] + W[i];
+            const uint32_t S0  = Rotr32(a,  2) ^ Rotr32(a, 13) ^ Rotr32(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2  = S0 + maj;
+            h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
         }
         state_[0]+=a; state_[1]+=b; state_[2]+=c; state_[3]+=d;
         state_[4]+=e; state_[5]+=f; state_[6]+=g; state_[7]+=h;
     }
+
     std::array<uint32_t, 8> state_{};
-    std::array<uint8_t, 64> block_{};
+    std::array<uint8_t,  64> block_{};
     uint64_t total_{};
-    size_t used_{};
+    size_t   used_{};
 };
 
+// ─── Pure-C++ SHA-512 implementation (no OpenSSL dependency) ─────────────────
 class Sha512 {
 public:
     Sha512() { Reset(); }
+
     void Update(const uint8_t *data, size_t length) {
         if (data == nullptr) return;
         total_ += length;
         while (length > 0) {
             const size_t take = length < (128 - used_) ? length : (128 - used_);
             memcpy(block_.data() + used_, data, take);
-            used_ += take;
-            data += take;
-            length -= take;
+            used_   += take;
+            data    += take;
+            length  -= take;
             if (used_ == 128) { Transform(block_.data()); used_ = 0; }
         }
     }
+
     std::array<uint8_t, 64> Final() {
-        const uint64_t bits = total_ * 8U;
-        const uint8_t marker = 0x80;
-        Update(&marker, 1);
+        const uint64_t bitLen = total_ * 8U;
+        // SHA-512 padding: 0x80, zeroes, 16-byte big-endian bit length
+        const uint8_t pad = 0x80;
+        Update(&pad, 1);
         const uint8_t zero = 0;
         while (used_ != 112) Update(&zero, 1);
-        uint8_t lengthBytes[16]{};
-        for (size_t i = 0; i < 8; ++i) lengthBytes[15 - i] = static_cast<uint8_t>(bits >> (i * 8U));
-        Update(lengthBytes, sizeof(lengthBytes));
+        uint8_t lenBytes[16]{};
+        for (size_t i = 0; i < 8; ++i)
+            lenBytes[15 - i] = static_cast<uint8_t>(bitLen >> (i * 8U));
+        Update(lenBytes, sizeof(lenBytes));
+        // Serialise state as big-endian bytes
         std::array<uint8_t, 64> digest{};
-        for (size_t i = 0; i < state_.size(); ++i) {
-            for (size_t j = 0; j < 8; ++j) {
+        for (size_t i = 0; i < state_.size(); ++i)
+            for (size_t j = 0; j < 8; ++j)
                 digest[i * 8 + j] = static_cast<uint8_t>(state_[i] >> (56U - j * 8U));
-            }
-        }
         return digest;
     }
+
 private:
-    static uint64_t RotateRight(uint64_t value, uint32_t count) {
-        return (value >> count) | (value << (64U - count));
-    }
+    static uint64_t Rotr64(uint64_t v, uint32_t n) { return (v >> n) | (v << (64U - n)); }
+
     void Reset() {
-        state_ = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
-                  0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+        state_ = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+                  0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+                  0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                  0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
         total_ = 0; used_ = 0;
     }
-    void Transform(const uint8_t *block) {
-        static constexpr uint64_t k[] = {
+
+    void Transform(const uint8_t *blk) {
+        static constexpr uint64_t K[80] = {
             0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
             0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
             0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
@@ -219,37 +246,36 @@ private:
             0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
             0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
             0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
-            0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
+            0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
         };
-        uint64_t words[80]{};
-        for (size_t i = 0; i < 16; ++i) {
-            words[i] = 0;
-            for (size_t j = 0; j < 8; ++j) {
-                words[i] |= static_cast<uint64_t>(block[i * 8 + j]) << (56U - j * 8U);
-            }
-        }
+        uint64_t W[80]{};
+        for (size_t i = 0; i < 16; ++i)
+            for (size_t j = 0; j < 8; ++j)
+                W[i] |= static_cast<uint64_t>(blk[i*8+j]) << (56U - j*8U);
         for (size_t i = 16; i < 80; ++i) {
-            const uint64_t s0 = RotateRight(words[i - 15], 1) ^ RotateRight(words[i - 15], 8) ^ (words[i - 15] >> 7U);
-            const uint64_t s1 = RotateRight(words[i - 2], 19) ^ RotateRight(words[i - 2], 61) ^ (words[i - 2] >> 6U);
-            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+            const uint64_t s0 = Rotr64(W[i-15],  1) ^ Rotr64(W[i-15],  8) ^ (W[i-15] >> 7U);
+            const uint64_t s1 = Rotr64(W[i- 2], 19) ^ Rotr64(W[i- 2], 61) ^ (W[i- 2] >> 6U);
+            W[i] = W[i-16] + s0 + W[i-7] + s1;
         }
-        uint64_t a=state_[0], b=state_[1], c=state_[2], d=state_[3], e=state_[4], f=state_[5], g=state_[6], h=state_[7];
+        uint64_t a=state_[0], b=state_[1], c=state_[2], d=state_[3],
+                 e=state_[4], f=state_[5], g=state_[6], h=state_[7];
         for (size_t i = 0; i < 80; ++i) {
-            const uint64_t s1 = RotateRight(e, 14) ^ RotateRight(e, 18) ^ RotateRight(e, 41);
-            const uint64_t choose = (e & f) ^ (~e & g);
-            const uint64_t temp1 = h + s1 + choose + k[i] + words[i];
-            const uint64_t s0 = RotateRight(a, 28) ^ RotateRight(a, 34) ^ RotateRight(a, 39);
-            const uint64_t majority = (a & b) ^ (a & c) ^ (b & c);
-            const uint64_t temp2 = s0 + majority;
-            h=g; g=f; f=e; e=d+temp1; d=c; c=b; b=a; a=temp1+temp2;
+            const uint64_t S1  = Rotr64(e, 14) ^ Rotr64(e, 18) ^ Rotr64(e, 41);
+            const uint64_t ch  = (e & f) ^ (~e & g);
+            const uint64_t t1  = h + S1 + ch + K[i] + W[i];
+            const uint64_t S0  = Rotr64(a, 28) ^ Rotr64(a, 34) ^ Rotr64(a, 39);
+            const uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint64_t t2  = S0 + maj;
+            h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
         }
         state_[0]+=a; state_[1]+=b; state_[2]+=c; state_[3]+=d;
         state_[4]+=e; state_[5]+=f; state_[6]+=g; state_[7]+=h;
     }
-    std::array<uint64_t, 8> state_{};
-    std::array<uint8_t, 128> block_{};
+
+    std::array<uint64_t, 8>  state_{};
+    std::array<uint8_t,  128> block_{};
     uint64_t total_{};
-    size_t used_{};
+    size_t   used_{};
 };
 
 bool ExtractFirstCertificateSha256(const std::vector<uint8_t> &signers, uint8_t outSha256[32]) {
